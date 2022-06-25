@@ -51,11 +51,7 @@ $ pip install keras
 
 ## Directories
 ```bash
-├───Deliverables
-├───Files
-│   ├───Excel Vector and Jpeg
-│   ├───Map
-│   └───Vectors
-├───Models
-└───Poster
+├───Data
+└───Word Embedding Weights
+    └───Pre-Trained Weights
 ```
