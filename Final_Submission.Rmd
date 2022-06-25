@@ -136,22 +136,28 @@ multiclass.roc(twittersparse_valid$sentiment, predictprob3)$auc
 
 # Deep-learning Approach
 
-Preprocessing of the tweets.
+## Preparing the data
 
-```{r}
-# Prepare ------------------------------------------------------------------
+We shall only change all the text to lowercase, replace drawn-out words with their correct spelling, replace emoticons with their associated emotion, and remove internet addresses. To do so, we will be using the `textclean` library.
+
+```{r message=FALSE, warning=FALSE}
+rm(list=ls()) 
+train <- read.csv("Data/train.csv", stringsAsFactors=FALSE)
+test <- read.csv("Data/test.csv", stringsAsFactors=FALSE)
+
 train <- train %>% mutate(Split = "train")
 test <- test %>% mutate(Split = "test")
 
 # Combine data for tokenization
-full <- data.frame(rbind(train %>% select(-sentiment), test%>% select(-id)))
+full <- data.frame(rbind(train %>% select(-sentiment), test %>% select(-id)))
 
-# Process Text --------------------------------------------------------------
+# Process the Text
 raw_text <- full$tweet
 
-processed_text <- raw_text %>% 
+# Using textclean library
+processed_text <- raw_text %>%
   tolower() %>%
-  replace_word_elongation() %>% 
+  replace_word_elongation() %>%
   replace_internet_slang() %>%
   replace_emoticon() %>%
   replace_url() %>%
@@ -162,14 +168,11 @@ full_processed <- full
 full_processed$tweet <- processed_text
 ```
 
-We need to have our training and test data in sequence form to in order to input them  into the RNN model for training and prediction.
-
-The RNN model only recognizes numerical input, hence we need to tokenize the tweets  before we can assign an index to each token, or word.
+Tokenization Step
 
 ```{r message=FALSE, warning=FALSE}
-# Tokenizer  ---------------------------------------------------------------
-max_words <- 15000 # Maximum number of words to consider as features
-maxlen <- 64 # Text cutoff after n words
+# Maximum number of words to consider as features, our vocabulary size
+max_words <- 15000
 
 # Prepare to tokenize the text
 texts <- full_processed$tweet
@@ -177,44 +180,180 @@ texts <- full_processed$tweet
 tokenizer <- text_tokenizer(num_words = max_words) %>% 
   fit_text_tokenizer(texts)
 
-# Tokenize - i.e. convert text into a sequence of integers
+# Tokenize - i.e. splits text into a sequence of integer tokens
 sequences <- texts_to_sequences(tokenizer, texts)
 word_index <- tokenizer$word_index
+```
+
+As the observations of our data could have varying lengths, the final sequence is zero-padded so that each input sequence is of the same length. We shall use the maximum observed raw sequence length to keep things simple as the standard sequence length. We also pad the sequences. 
+
+For any observation, if there are no words in the $i^{th}$ position of the sequence, it is simply represented as a token with value $0$.
+
+```{r}
+# Length of sequence
+maxlen <- max(as.numeric(summary(sequences)[,1]))
 
 # Pad out texts so everything is the same length
 data <- pad_sequences(sequences, maxlen = maxlen)
+```
 
+Then we perform one-hot encoding of the train labels, as `Keras` requires data inputs to be of the matrix class. Note the test labels are not given in the Kaggle competition.
+
+```{r}
 # Split back into train and test
 train_matrix <- data[1:nrow(train),]
 test_matrix <- data[(nrow(train)+1):nrow(data),]
 
 # One-hot encoding of train_labels
 train_labels <- dummy_cols(data.frame(V=train$sentiment)) %>% select(everything(),-V)
-
-# Split into Training and validation set
-set.seed(7)
-trainid <- sample.split(train$sentiment, 0.8)
-
-x_train <- train_matrix[trainid,]
-y_train <- labels[trainid,]
-
-x_val <- train_matrix[!trainid,]
-y_val <- labels[!trainid,]
 ```
 
-# Model Building
+Finally, we create a training and validation split for the training data.
 
-Now we begin to build the model and its layers.
+```{r}
+# Split into training and validation set
+trainid <- sample.split(train$sentiment, 0.7)
+
+x_train <- as.matrix(train_matrix[trainid,])
+y_train <- as.matrix(train_labels[trainid,])
+
+x_val <- as.matrix(train_matrix[!trainid,])
+y_val <- as.matrix(train_labels[!trainid,])
+```
+
+## Simple RNN model
 
 ```{r message=FALSE, warning=FALSE}
-# Building the Model -------------------------------------------------------
+# Word Embedding 
+embedding_dim <- 11 
+# According to https://developers.googleblog.com/2017/11/introducing-tensorflow-feature-columns.html
+# Number of embedding dim = vocab_size**0.25
 
-# Pre-Trained Word Vectors
-fasttext_twitter_embedding_dim <- 100
+model1 <- keras_model_sequential() %>%
+  layer_embedding(input_dim = max_words, # Size of the vocabulary of the word embedding
+                  output_dim = embedding_dim, # No. of features of each token 
+                  input_length = maxlen) %>%  # No. of tokens to be created = input sequence length, number of timesteps
+  layer_simple_rnn(units = 30, # n, size of the hidden layers (weight matrices)
+                   return_sequences = FALSE) %>%
+  layer_dense(units = 3, activation = "softmax")
+
+summary(model1)
+plot_model(model1)
+```
+
+Lets compile and fit the model!
+
+```{r}
+# Compile model
+model1 %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.01),
+  loss = "categorical_crossentropy",
+  metrics = "categorical_accuracy"
+)
+
+history <- model1 %>% fit(
+  x_train,
+  y_train,
+  batch_size = 64,
+  validation_data = list(x_val, y_val),
+  epochs = 100,
+  view_metrics = FALSE,
+  verbose = 0
+)
+
+print(history)
+plot(history)
+
+# Final training accuracy
+round(history$metrics$categorical_accuracy[length(history$metrics$categorical_accuracy)],3)
+# Final validation accuracy
+round(history$metrics$val_categorical_accuracy[length(history$metrics$val_categorical_accuracy)],3)
+```
+
+We can observe that the performance of a simple RNN model on our sentiment analysis task is not very ideal, with a training accuracy of `r round(history$metrics$categorical_accuracy[length(history$metrics$categorical_accuracy)],3)` and validation accuracy of `r round(history$metrics$val_categorical_accuracy[length(history$metrics$val_categorical_accuracy)],3)`. This is actually due to the vanishing gradient problem that we discussed earlier! To see this, we will approach this task using a LSTM model instead, keeping all other parameters the same.
+
+## Simple LSTM model
+
+```{r}
+# Word Embedding 
+model2 <- keras_model_sequential()
+model2 %>%
+  layer_embedding(input_dim = max_words, 
+                  output_dim = embedding_dim, 
+                  input_length = maxlen) %>%  
+  layer_lstm(units = 30,
+             return_sequences = FALSE) %>%
+  layer_dense(units = 3, activation = "softmax")
+
+summary(model2)
+plot_model(model2)
+```
+
+Lets compile and fit the LSTM model!
+
+```{r}
+# Compile model
+model2 %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.01),
+  loss = "categorical_crossentropy",
+  metrics = "categorical_accuracy"
+)
+
+history2 <- model2 %>% fit(
+  x_train,
+  y_train,
+  batch_size = 64,
+  validation_data = list(x_val, y_val),
+  epochs = 100,
+  view_metrics = FALSE,
+  verbose = 0
+)
+
+print(history2)
+plot(history2)
+
+# Final training accuracy
+round(history2$metrics$categorical_accuracy[length(history2$metrics$categorical_accuracy)],3)
+# Final validation accuracy
+round(history2$metrics$val_categorical_accuracy[length(history2$metrics$val_categorical_accuracy)],3)
+```
+
+Just by switching from a simple RNN model to an LSTM model, where the main difference between the two implementations is that the issue of vanishing gradient is addressed, we can observe an increase in the model's performance. With the LSTM model, we achieve a training accuracy of `r round(history2$metrics$categorical_accuracy[length(history2$metrics$categorical_accuracy)],3)` and validation accuracy of `r round(history2$metrics$val_categorical_accuracy[length(history2$metrics$val_categorical_accuracy)],3)`.  Note the difference in training accuracy compared to our very first example of using a classification tree. A neural network model built on the concept of sequential data performs way better!
+
+## Ways to improve performance
+
+Despite the increase in model performance, it is evident that the model is over fitting to the training data. There could be many reasons for this, perhaps there are some under-represented words in the training data, or perhaps there was too little training data, etc. 
+
+So how can we improve our performance?
+
+* Increase generality of model
+    + Add dropout and regularization
+* Hyper-parameter tuning
+    + Experiment with different hyper-parameter settings
+* Data augmentation
+    + Back Translation (Make the data more diverse by translating it to another language and back)
+    + Easy Data Augmentation (Synonym replacement, Random insertion, Random swap, Random deletion)
+    + Contextualized Word Embeddings (ELMo)
+* Use more complex and state-of-the art models
+    + Transfer learning (Pre-trained word embeddings)
+    + Transformer-based models (BERT) 
+    + Multitask Unified Model (MUM) 
+    
+## Complex LSTM model with Pre-trained Word Embeddings
+
+The two pre-trained word embeddings are:
+
+* GloVe Twitter 200 
+* Fast Text Twitter 100
+
+For the deep neural network, we added an additional dense layer of size 128 to increase the number of training parameters. Also for the respective LSTM layers, we shall increase the size to 64. To improve the over fitting we had, we shall include 2 dropout layers.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Pre-Trained Word Embedding
 glove_twitter_embedding_dim <- 200
-
+fasttext_twitter_embedding_dim <- 100
+glove_twitter_weights <- readRDS("Word Embedding Weights/glove_twitter_27B_200d.rds") 
 fasttext_twitter_weights <- readRDS("Word Embedding Weights/fasttext_english_twitter_100d.rds")
-glove_twitter_weights <- readRDS("Word Embedding Weights/glove_twitter_27B_200d.rds")
 
 # Input layer
 input <- layer_input(
@@ -223,170 +362,101 @@ input <- layer_input(
   name = "input"
 )
 
-# Embedding and LSTM layer 1
+# Glove Embedding and LSTM layer 1
 encoded_1 <- input %>%
-  layer_embedding(input_dim = max_words,input_length = maxlen, output_dim = fasttext_twitter_embedding_dim, name = "embedding_1") %>%
-  layer_lstm(units = maxlen,
-             dropout = 0.4,
-             recurrent_dropout = 0.5,
+  layer_embedding(name = "glove_twitter_embedding",
+                  input_dim = max_words, 
+                  output_dim = glove_twitter_embedding_dim, 
+                  input_length = maxlen) %>%  
+  layer_lstm(units = 64, 
+             input_shape = c(maxlen, glove_twitter_embedding_dim), 
              return_sequences = FALSE)
 
-# Embedding and LSTM layer 2
+# Fasttext Embedding and LSTM layer 2
 encoded_2 <- input %>% 
-  layer_embedding(input_dim = max_words,input_length = maxlen, output_dim = glove_twitter_embedding_dim, name = "embedding_2") %>%
-  layer_lstm(units = maxlen,
-             dropout = 0.4,
-             recurrent_dropout = 0.5,
+  layer_embedding(name = "fasttext_twitter_embedding",
+                  input_dim = max_words, 
+                  output_dim = fasttext_twitter_embedding_dim, 
+                  input_length = maxlen) %>%  
+  layer_lstm(units = 64, 
+             input_shape = c(maxlen, fasttext_twitter_embedding_dim), 
              return_sequences = FALSE)
 
-# Concatenated LSTM layers
-concatenated <- layer_concatenate(list(encoded_1,encoded_2))
-
-# Dense layers
-dense <- concatenated %>% 
+model3 <-keras_model(input,(
+  layer_concatenate(list(encoded_1,encoded_2)) %>% 
   layer_dropout(rate = 0.5) %>% 
   layer_dense(units = 128, activation = "relu") %>% 
   layer_dropout(rate = 0.5) %>% 
-  layer_dense(units = 3, activation = "softmax")
+  layer_dense(units = 3, activation = "softmax")))
 
-##########################################################################
+# Set the weights to the pretrained word embedding weights
+get_layer(model3, name = "glove_twitter_embedding") %>%
+  set_weights(list(glove_twitter_weights)) %>%
+  freeze_weights()
 
-# Bring model together
-model <- keras_model(input, dense)
-
-# Freeze pre-trained word embedding weights
-get_layer(model, name = "embedding_1") %>%
+get_layer(model3, name = "fasttext_twitter_embedding") %>%
   set_weights(list(fasttext_twitter_weights)) %>%
   freeze_weights()
 
-get_layer(model, name = "embedding_2") %>% 
-  set_weights(list(glove_twitter_weights)) %>% 
-  freeze_weights()
+summary(model3)
+```
 
-# Model Hyperparameters
-model %>% compile(
-  optimizer = optimizer_rmsprop(lr = 0.001),
+Lets compile and fit the new LSTM model! For our learning rate we shall use 0.001 instead of 0.01 to see if we get better results.
+
+```{r}
+# Compile model
+
+model3 %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
   loss = "categorical_crossentropy",
   metrics = "categorical_accuracy"
 )
 
-# Print architecture 
-print(model)
-```
-
-# Model Trainings 
-
-1st Training of the Model with learning rate 0.001.
-
-```{r message=FALSE, warning=FALSE}
-# Model Training #1 -------------------------------------------------------------------
-
-# Early stopping condition
-callbacks_list <- list(
-  callback_early_stopping(
-    monitor = 'val_loss', 
-    patience = 10,
-    restore_best_weights = TRUE
-  ))
-
-# Train model 
-set_random_seed(7)
-history <- model %>% fit(
+# Fit model 
+history3 <- model3 %>% fit(
   x_train,
   y_train,
-  batch_size = 128,
+  batch_size = 64,
   validation_data = list(x_val, y_val),
   epochs = 100,
   view_metrics = FALSE,
-  verbose = 0, # set to 1 to see the progression
-  callbacks =  callbacks_list,
-  
+  verbose = 0
 )
 
-# Look at training results
-print(history)
-plot(history)
-
+print(history3)
+plot(history3)
 ```
 
-Further Training of the Model with learning rate 0.0001.
+Now that we notice our model results plateauing ,let us use a even smaller learning rate to see if we can obtain even better results. This concept is called **adaptive learning rate**. In addition, we will unfreeze all the weights including the pretrained word embedding for small fine tuning.
 
 ```{r message=FALSE, warning=FALSE}
-# Model Training #2 -------------------------------------------------------------------
-
 # Unfreeze weights
-unfreeze_weights(model, from = "input")
+unfreeze_weights(model3, from = "input")
 
 # Reduce LR and compile
-model %>% compile(
+model3 %>% compile(
   optimizer = optimizer_rmsprop(lr = 0.0001),
   loss = "categorical_crossentropy",
   metrics = "categorical_accuracy"
 )
 
-# Train model briefly
-set_random_seed(7)
-history_v2 <- model %>% fit(
+# Train model briefly, 50 epochs instead of 100
+history3b <- model3 %>% fit(
   x_train,
   y_train,
-  batch_size = 32,
+  batch_size = 64,
   validation_data = list(x_val, y_val),
   epochs = 50,
   view_metrics = FALSE,
-  callbacks =  callbacks_list,
   verbose = 0
 )
 
 # Look at training results
-print(history_v2)
-plot(history_v2)
-```
+print(history3b)
+plot(history3b)
 
-# Model Results 
-
-```{r message=FALSE, warning=FALSE}
-#save_model_hdf5(model, "Results/LSTM_model.hdf5")
-
-# To load the saved model (for Instructor's use)
-# saved_model <- load_model_hdf5("Results/LSTM_model.hdf5")
-
-# Run model on Test set  -------------------------------------------------------------------
-predictions <- predict(model, test_matrix)
-predictions <- apply(predictions,1,which.max)
-
-# Write to csv
-submission <- data.frame(cbind(test$id, predictions))
-colnames(submission) <- c("id", "sentiment")
-# write_csv(submission, "Results/Predictions.csv")
-```
-
-# Results Visualization 
-
-```{r message=FALSE, warning=FALSE}
-# To obtain clearer plot (Training #1)
-epochs <- seq(1:length(history$metrics$val_categorical_accuracy))
-
-val_accuracy <- history$metrics$val_categorical_accuracy
-val_loss <- history$metrics$val_loss
-
-train_accuracy <- history$metrics$categorical_accuracy
-train_loss <- history$metrics$loss
-
-val_df <- data.frame(categorical_accuracy=val_accuracy, epoch=epochs,loss=val_loss, type="validation")
-train_df <- data.frame(categorical_accuracy=train_accuracy, epoch=epochs,loss=train_loss, type="train")
-
-plot_df <- rbind(train_df,val_df)
-plot_df$type <- as.factor(plot_df$type)
-
-ggplot(plot_df) +
-  geom_point(aes(epoch, categorical_accuracy, fill=type), color="black",pch=21) +
-  geom_smooth(aes(epoch, categorical_accuracy, color=type), se=F) +
-  labs(fill="data", color="data") +
-  xlim(0,50)
-
-ggplot(plot_df) +
-  geom_point(aes(epoch, loss, fill=type), color="black",pch=21) +
-  geom_smooth(aes(epoch, loss, color=type), se=F) +
-  labs(fill="data", color="data") +
-  xlim(0,50)
+# Final training accuracy
+round(history3b$metrics$categorical_accuracy[length(history3b$metrics$categorical_accuracy)],3)
+# Final validation accuracy
+round(history3b$metrics$val_categorical_accuracy[length(history3b$metrics$val_categorical_accuracy)],3)
 ```
