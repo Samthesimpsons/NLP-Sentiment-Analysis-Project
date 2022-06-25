@@ -1,0 +1,392 @@
+---
+title: "Twitter Sentiment Analysis Kaggle Competition"
+subtitle: "The Analytical Edge"
+author: Samuel Sim Wei Xuan, Lee Min Shuen
+date: "Term 6"
+output: 
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+<style>
+body {
+text-align: justify}
+</style>
+
+# Preparation 
+
+Preparing environment and loading datasets.
+
+```{r message=FALSE, warning=FALSE}
+# Clear Environment -------------------------------------------------------
+rm(list=ls()) 
+
+# Libraries ---------------------------------------------------------------
+
+library(tidyverse) # To load dplyr, ggplot2
+library(caTools) # For sample.split
+library(keras) # To load the neural network package
+library(reticulate) # To enable python calling when using Keras
+library(randomForest) # For Random Forest
+library(e1071) # For Naive Bayes Classification
+library(rpart) # For Classification Tree
+library(pROC) # For multiclass ROC
+library(tm) # To load text mining package
+library(textclean) # To load text cleaning package
+library(fastDummies) # One-hot encoding
+library(deepviz) # For RNN/LSTM vis
+
+# Import ------------------------------------------------------------------
+train <- read.csv("Data/train.csv", stringsAsFactors=FALSE)
+test <- read.csv("Data/test.csv", stringsAsFactors=FALSE)
+```
+
+# Probabilisitc Approach
+
+## Preparing Data
+
+```{r message=FALSE, warning=FALSE}
+# Read the Twitter data
+train <- read.csv("Data/train.csv", stringsAsFactors = F)
+
+# Preparing document term matrix using tm package
+corpus <- Corpus(VectorSource(train$tweet))
+corpus <- tm_map(corpus,content_transformer(tolower))
+corpus <- tm_map(corpus,removeWords,stopwords("english"))
+corpus <- tm_map(corpus,removePunctuation)
+corpus <- tm_map(corpus,stemDocument)
+dtm <- DocumentTermMatrix(corpus)
+dtm <- removeSparseTerms(dtm, 0.995)
+
+twittersparse <- as.data.frame(as.matrix(dtm))
+colnames(twittersparse) <- make.names(colnames(twittersparse))
+twittersparse$sentiment <- train$sentiment
+
+# Check if data is imbalanced
+table(train$sentiment)/nrow(train)
+
+# Split on the labels
+trainid <- sample.split(twittersparse$sentiment, 0.7)
+twittersparse_train <- twittersparse[trainid,]
+twittersparse_valid <- twittersparse[!trainid,]
+```
+
+## Classification Tree (with pruning)
+
+```{r}
+model_CT <- rpart(sentiment~.,data = twittersparse_train, method = "class",cp=10^-6)
+opt <- which.min(model_CT$cptable[,"xerror"])
+cp <- model_CT$cptable[opt, "CP"]
+model_CT <- prune(model_CT,cp)
+
+# model_CT <- saveRDS(model_CT,"model_CT.rds")
+# model_CT <- readRDS("model_CT.rds")
+
+predictclass1 <- predict(model_CT,newdata=twittersparse_valid,type="class")
+confusionmatrix1  <- table(predictclass1,twittersparse_valid$sentiment) 
+Accuracy1 <- sum(diag(confusionmatrix1))/sum(confusionmatrix1)
+Accuracy1
+```
+
+## Random Forest (without grid parameter search)
+
+```{r}
+model_RF <- randomForest(as.factor(sentiment)~.,data=twittersparse_train)
+
+# model_RF <- saveRDS(model_RF,"model_RF.rds")
+# model_RF <- readRDS("model_RF.rds")
+
+predictclass2 <- predict(model_RF,newdata=twittersparse_valid,type="class")
+confusionmatrix2  <- table(predictclass2,twittersparse_valid$sentiment) 
+Accuracy2 <- sum(diag(confusionmatrix2))/sum(confusionmatrix2)
+Accuracy2
+```
+
+## Naive Bayes Classifier
+
+```{r}
+model_NB <- naiveBayes(as.factor(sentiment)~.,data=twittersparse_train)
+
+# model_NB <- saveRDS(model_NB,"model_NB.rds")
+# model_NB <- readRDS("model_NB.rds")
+
+predictclass3 <- predict(model_NB,newdata=twittersparse_valid,type="class")
+confusionmatrix3  <- table(predictclass3,twittersparse_valid$sentiment) 
+Accuracy3 <- sum(diag(confusionmatrix3))/sum(confusionmatrix3)
+Accuracy3
+```
+
+## AUC Values
+
+```{r}
+# Get the probabilities
+predictprob1 <- predict(model_CT,newdata=twittersparse_valid,type="prob") # Classfication Tree
+predictprob2 <- predict(model_RF,newdata=twittersparse_valid,type="prob") # Random Forest
+predictprob3 <- predict(model_NB,newdata=twittersparse_valid,type="raw") # Naive Bayes
+
+# Calculate AUCs
+multiclass.roc(twittersparse_valid$sentiment, predictprob1)$auc
+multiclass.roc(twittersparse_valid$sentiment, predictprob2)$auc
+multiclass.roc(twittersparse_valid$sentiment, predictprob3)$auc
+```
+
+# Deep-learning Approach
+
+Preprocessing of the tweets.
+
+```{r}
+# Prepare ------------------------------------------------------------------
+train <- train %>% mutate(Split = "train")
+test <- test %>% mutate(Split = "test")
+
+# Combine data for tokenization
+full <- data.frame(rbind(train %>% select(-sentiment), test%>% select(-id)))
+
+# Process Text --------------------------------------------------------------
+raw_text <- full$tweet
+
+processed_text <- raw_text %>% 
+  tolower() %>%
+  replace_word_elongation() %>% 
+  replace_internet_slang() %>%
+  replace_emoticon() %>%
+  replace_url() %>%
+  replace_email() %>%
+  replace_html()
+
+full_processed <- full
+full_processed$tweet <- processed_text
+```
+
+We need to have our training and test data in sequence form to in order to input them  into the RNN model for training and prediction.
+
+The RNN model only recognizes numerical input, hence we need to tokenize the tweets  before we can assign an index to each token, or word.
+
+```{r message=FALSE, warning=FALSE}
+# Tokenizer  ---------------------------------------------------------------
+max_words <- 15000 # Maximum number of words to consider as features
+maxlen <- 64 # Text cutoff after n words
+
+# Prepare to tokenize the text
+texts <- full_processed$tweet
+
+tokenizer <- text_tokenizer(num_words = max_words) %>% 
+  fit_text_tokenizer(texts)
+
+# Tokenize - i.e. convert text into a sequence of integers
+sequences <- texts_to_sequences(tokenizer, texts)
+word_index <- tokenizer$word_index
+
+# Pad out texts so everything is the same length
+data <- pad_sequences(sequences, maxlen = maxlen)
+
+# Split back into train and test
+train_matrix <- data[1:nrow(train),]
+test_matrix <- data[(nrow(train)+1):nrow(data),]
+
+# One-hot encoding of train_labels
+train_labels <- dummy_cols(data.frame(V=train$sentiment)) %>% select(everything(),-V)
+
+# Split into Training and validation set
+set.seed(7)
+trainid <- sample.split(train$sentiment, 0.8)
+
+x_train <- train_matrix[trainid,]
+y_train <- labels[trainid,]
+
+x_val <- train_matrix[!trainid,]
+y_val <- labels[!trainid,]
+```
+
+# Model Building
+
+Now we begin to build the model and its layers.
+
+```{r message=FALSE, warning=FALSE}
+# Building the Model -------------------------------------------------------
+
+# Pre-Trained Word Vectors
+fasttext_twitter_embedding_dim <- 100
+glove_twitter_embedding_dim <- 200
+
+fasttext_twitter_weights <- readRDS("Word Embedding Weights/fasttext_english_twitter_100d.rds")
+glove_twitter_weights <- readRDS("Word Embedding Weights/glove_twitter_27B_200d.rds")
+
+# Input layer
+input <- layer_input(
+  shape = list(NULL),
+  dtype = "int32",
+  name = "input"
+)
+
+# Embedding and LSTM layer 1
+encoded_1 <- input %>%
+  layer_embedding(input_dim = max_words,input_length = maxlen, output_dim = fasttext_twitter_embedding_dim, name = "embedding_1") %>%
+  layer_lstm(units = maxlen,
+             dropout = 0.4,
+             recurrent_dropout = 0.5,
+             return_sequences = FALSE)
+
+# Embedding and LSTM layer 2
+encoded_2 <- input %>% 
+  layer_embedding(input_dim = max_words,input_length = maxlen, output_dim = glove_twitter_embedding_dim, name = "embedding_2") %>%
+  layer_lstm(units = maxlen,
+             dropout = 0.4,
+             recurrent_dropout = 0.5,
+             return_sequences = FALSE)
+
+# Concatenated LSTM layers
+concatenated <- layer_concatenate(list(encoded_1,encoded_2))
+
+# Dense layers
+dense <- concatenated %>% 
+  layer_dropout(rate = 0.5) %>% 
+  layer_dense(units = 128, activation = "relu") %>% 
+  layer_dropout(rate = 0.5) %>% 
+  layer_dense(units = 3, activation = "softmax")
+
+##########################################################################
+
+# Bring model together
+model <- keras_model(input, dense)
+
+# Freeze pre-trained word embedding weights
+get_layer(model, name = "embedding_1") %>%
+  set_weights(list(fasttext_twitter_weights)) %>%
+  freeze_weights()
+
+get_layer(model, name = "embedding_2") %>% 
+  set_weights(list(glove_twitter_weights)) %>% 
+  freeze_weights()
+
+# Model Hyperparameters
+model %>% compile(
+  optimizer = optimizer_rmsprop(lr = 0.001),
+  loss = "categorical_crossentropy",
+  metrics = "categorical_accuracy"
+)
+
+# Print architecture 
+print(model)
+```
+
+# Model Trainings 
+
+1st Training of the Model with learning rate 0.001.
+
+```{r message=FALSE, warning=FALSE}
+# Model Training #1 -------------------------------------------------------------------
+
+# Early stopping condition
+callbacks_list <- list(
+  callback_early_stopping(
+    monitor = 'val_loss', 
+    patience = 10,
+    restore_best_weights = TRUE
+  ))
+
+# Train model 
+set_random_seed(7)
+history <- model %>% fit(
+  x_train,
+  y_train,
+  batch_size = 128,
+  validation_data = list(x_val, y_val),
+  epochs = 100,
+  view_metrics = FALSE,
+  verbose = 0, # set to 1 to see the progression
+  callbacks =  callbacks_list,
+  
+)
+
+# Look at training results
+print(history)
+plot(history)
+
+```
+
+Further Training of the Model with learning rate 0.0001.
+
+```{r message=FALSE, warning=FALSE}
+# Model Training #2 -------------------------------------------------------------------
+
+# Unfreeze weights
+unfreeze_weights(model, from = "input")
+
+# Reduce LR and compile
+model %>% compile(
+  optimizer = optimizer_rmsprop(lr = 0.0001),
+  loss = "categorical_crossentropy",
+  metrics = "categorical_accuracy"
+)
+
+# Train model briefly
+set_random_seed(7)
+history_v2 <- model %>% fit(
+  x_train,
+  y_train,
+  batch_size = 32,
+  validation_data = list(x_val, y_val),
+  epochs = 50,
+  view_metrics = FALSE,
+  callbacks =  callbacks_list,
+  verbose = 0
+)
+
+# Look at training results
+print(history_v2)
+plot(history_v2)
+```
+
+# Model Results 
+
+```{r message=FALSE, warning=FALSE}
+#save_model_hdf5(model, "Results/LSTM_model.hdf5")
+
+# To load the saved model (for Instructor's use)
+# saved_model <- load_model_hdf5("Results/LSTM_model.hdf5")
+
+# Run model on Test set  -------------------------------------------------------------------
+predictions <- predict(model, test_matrix)
+predictions <- apply(predictions,1,which.max)
+
+# Write to csv
+submission <- data.frame(cbind(test$id, predictions))
+colnames(submission) <- c("id", "sentiment")
+# write_csv(submission, "Results/Predictions.csv")
+```
+
+# Results Visualization 
+
+```{r message=FALSE, warning=FALSE}
+# To obtain clearer plot (Training #1)
+epochs <- seq(1:length(history$metrics$val_categorical_accuracy))
+
+val_accuracy <- history$metrics$val_categorical_accuracy
+val_loss <- history$metrics$val_loss
+
+train_accuracy <- history$metrics$categorical_accuracy
+train_loss <- history$metrics$loss
+
+val_df <- data.frame(categorical_accuracy=val_accuracy, epoch=epochs,loss=val_loss, type="validation")
+train_df <- data.frame(categorical_accuracy=train_accuracy, epoch=epochs,loss=train_loss, type="train")
+
+plot_df <- rbind(train_df,val_df)
+plot_df$type <- as.factor(plot_df$type)
+
+ggplot(plot_df) +
+  geom_point(aes(epoch, categorical_accuracy, fill=type), color="black",pch=21) +
+  geom_smooth(aes(epoch, categorical_accuracy, color=type), se=F) +
+  labs(fill="data", color="data") +
+  xlim(0,50)
+
+ggplot(plot_df) +
+  geom_point(aes(epoch, loss, fill=type), color="black",pch=21) +
+  geom_smooth(aes(epoch, loss, color=type), se=F) +
+  labs(fill="data", color="data") +
+  xlim(0,50)
+```

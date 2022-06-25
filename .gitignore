@@ -1,0 +1,5 @@
+*.docx
+*.RData
+*.Rhistory
+*Word Embedding Weights/Pre-Trained Weights/fasttext_english_twitter_100d.vec
+*Word Embedding Weights/Pre-Trained Weights/glove.twitter.27B.200d.txt
